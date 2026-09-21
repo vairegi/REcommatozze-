@@ -1488,16 +1488,22 @@ async function handleChannelsCommand(args: {
   if (buckets.group.length)
     sections.push(`👥 <b>Groups (${buckets.group.length})</b>\n${numbered(buckets.group)}`);
 
-  const text = sections.length
+  // Telegram caps messages at 4096 chars - split long lists into parts.
+  const fullList = sections.length
     ? sections.join("\n\n")
     : "No chats found where I am admin.";
-
-  await telegramCall("sendMessage", {
-    chat_id: dmChatId,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+  const MAXLEN = 3800;
+  const chunks: string[] = [];
+  let cur = "";
+  for (const line of fullList.split("\n")) {
+    if (cur && (cur + "\n" + line).length > MAXLEN) { chunks.push(cur); cur = line; }
+    else { cur = cur ? cur + "\n" + line : line; }
+  }
+  if (cur) chunks.push(cur);
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const head = chunks.length > 1 ? `📋 <b>Chats (part ${ci + 1}/${chunks.length})</b>\n\n` : "";
+    await telegramCall("sendMessage", { chat_id: dmChatId, text: head + chunks[ci], parse_mode: "HTML", disable_web_page_preview: true });
+  }
 }
 
 async function handleCheckMemberCommand(args: {
