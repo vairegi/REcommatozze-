@@ -49,9 +49,11 @@ function arg(v: string | null): Arg {
 }
 
 function endpoint(): string {
-  const raw = process.env.TURSO_DATABASE_URL;
+  // Accept libsql://, turso://, https:// (and a bare host): the Turso dashboard
+  // and CLI print different schemes, and Node fetch only speaks http(s).
+  const raw = (process.env.TURSO_DATABASE_URL ?? "").trim();
   if (!raw) throw new Error("TURSO_DATABASE_URL is not set");
-  const https = raw.replace(/^libsql:\/\//, "https://").replace(/\/$/, "");
+  const https = raw.replace(/^(libsql|turso|https?):\/\//, "https://").replace(/\/$/, "");
   return `${https}/v2/pipeline`;
 }
 

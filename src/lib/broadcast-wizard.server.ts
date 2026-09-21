@@ -1426,6 +1426,7 @@ async function commitDraft(fromId: number, fromName: string, chatId: number) {
       broadcast_id: bc.id,
       chat_id: cid,
       chat_title: c?.title ?? c?.username ?? String(cid),
+      status: "pending",
     };
   });
   await supabaseAdmin.from("broadcast_targets").insert(targetRows);
@@ -1517,7 +1518,7 @@ async function commitSplitDraft(fromId: number, fromName: string, chatId: number
       continue;
     }
     await supabaseAdmin.from("broadcast_targets").insert(
-      v.chatIds.map((cid) => ({ broadcast_id: (bc as any).id, chat_id: cid, chat_title: titleOf(cid) })),
+      v.chatIds.map((cid) => ({ broadcast_id: (bc as any).id, chat_id: cid, chat_title: titleOf(cid), status: "pending" })),
     );
     created.push({ label: v.label, id: (bc as any).id, count: v.chatIds.length });
   }

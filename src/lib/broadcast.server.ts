@@ -386,6 +386,11 @@ export async function executeBroadcast(broadcastId: string): Promise<{
   const albumIds: number[] = ((bc as any).source_message_ids ?? []).map(Number).filter(Boolean);
   const isAlbum = albumIds.length > 1;
   const list = targets ?? [];
+  if (!list.length) {
+    console.warn(
+      `broadcast ${broadcastId}: 0 pending targets — nothing to send. Target rows must have status="pending".`,
+    );
+  }
   const sendOne = async (t: any) => {
     try {
       let mid: number | undefined;
@@ -438,6 +443,7 @@ export async function executeBroadcast(broadcastId: string): Promise<{
       });
     } catch (e: any) {
       const msg = e?.message ?? String(e);
+      console.error(`broadcast ${broadcastId}: target ${t.chat_id} failed: ${msg}`);
       await supabaseAdmin
         .from("broadcast_targets")
         .update({ status: "failed", error: msg })
@@ -462,7 +468,7 @@ export async function executeBroadcast(broadcastId: string): Promise<{
 
   const okCount = results.filter((r) => r.ok).length;
   const status: "sent" | "partial" | "failed" =
-    okCount === results.length ? "sent" : okCount === 0 ? "failed" : "partial";
+    results.length === 0 ? "failed" : okCount === results.length ? "sent" : okCount === 0 ? "failed" : "partial";
 
   await supabaseAdmin
     .from("broadcasts")

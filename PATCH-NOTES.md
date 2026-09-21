@@ -1,17 +1,28 @@
-# Patch: fix "fetch failed" Turso connection on Render
+# Patch v2 — fixes posting, /restore loop, and silent logs
 
-## Root cause
-TURSO_DATABASE_URL was set with a `turso://` scheme (what Turso CLI prints).
-src/db.ts only converted `libsql://` to `https://`, so it tried to fetch
-`turso://.../v2/pipeline` — Node fetch cannot speak that scheme -> "fetch failed".
-With the DB unreachable, every admin insert silently failed, which is why the bot
-re-claimed you as owner on every message and /addadmin always failed.
+Overwrite these files into your repo (paths preserved):
+  src/db.ts
+  src/index.ts
+  src/webhook.ts
+  src/lib/broadcast-wizard.server.ts
+  src/lib/broadcast.server.ts
 
-## Changed files (overwrite into repo, keeping folder structure)
-- src/db.ts    — endpoint() now accepts libsql://, turso://, https:// or bare host; trims whitespace.
-- src/index.ts — schema-init error logging now prints the underlying cause.
+Then: git add -A && git commit -m "fix: posting + restore loop + logging" && git push
+Render auto-deploys on push.
 
-## Deploy steps
-1. Copy these two files over the ones in your repo, commit, push.
-2. Render redeploys automatically on push. Logs should no longer show "Turso schema init failed".
-3. DM the bot /whoami — should say super admin and stop re-claiming ownership.
+## What each fix does
+1. src/db.ts — endpoint() now accepts libsql://, turso://, https:// (fixes "fetch failed").
+2. src/webhook.ts — update_id idempotency guard. Telegram re-delivers slow updates;
+   this stops /restore and broadcasts running 5-6 times in a row.
+3. src/lib/broadcast-wizard.server.ts — target rows now get status:"pending".
+   THE posting bug: targets were inserted with no status, so executeBroadcast's
+   .eq("status","pending") query matched 0 rows -> "0 delivered".
+4. src/lib/broadcast.server.ts — logs every per-target failure; never reports
+   "delivered" when 0 targets were sent.
+5. src/index.ts — process-level unhandledRejection/uncaughtException handlers so
+   nothing fails silently in the Render logs.
+
+## After deploy, re-verify
+- /healthz  -> {"ok":true}
+- Send a test broadcast -> should say "1 delivered"
+- /restore  -> runs ONCE, not in a loop

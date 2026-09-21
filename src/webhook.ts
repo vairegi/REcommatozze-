@@ -6,6 +6,10 @@ function safeEqual(a: string, b: string): boolean {
   return A.length === B.length && timingSafeEqual(A, B);
 }
 
+// Idempotency guard: Telegram re-delivers an update when the webhook is slow to
+// ACK. Without this, /restore and broadcasts executed several times in a row.
+const seenUpdates = new Map<number, number>();
+
 async function isBotAdmin(supabaseAdmin: any, fromId: number): Promise<{ role: string | null; is: boolean }> {
   const { data } = await supabaseAdmin
     .from("telegram_bot_admins")
@@ -801,6 +805,17 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
         const update = await request.json();
         if (typeof update.update_id !== "number") {
           return Response.json({ ok: true, ignored: true });
+        }
+
+        // Skip any update we've already started (Telegram retries slow webhooks).
+        {
+          const nowMs = Date.now();
+          for (const [id, ts] of seenUpdates) if (nowMs - ts > 10 * 60_000) seenUpdates.delete(id);
+          if (seenUpdates.has(update.update_id)) {
+            console.warn(`duplicate update ${update.update_id} ignored`);
+            return Response.json({ ok: true, duplicate: true });
+          }
+          seenUpdates.set(update.update_id, nowMs);
         }
 
         // Callback queries (inline button taps) — route broadcast wizard first.
@@ -2316,6 +2331,7 @@ async function handleRestoreDocument(args: {
     }
     await telegramCall("sendMessage", { chat_id: chatId, text: lines.join("\n"), parse_mode: "HTML" });
   } catch (e: any) {
+    console.error("restore failed:", e?.message ?? e, "\n", e?.stack ?? "");
     await telegramCall("sendMessage", { chat_id: chatId, text: `❌ Restore failed: ${e?.message ?? "unknown"}` });
   }
 }

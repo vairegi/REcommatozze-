@@ -4,6 +4,14 @@ import { handleWebhookRequest } from "@/webhook";
 import { deriveWebhookSecret, telegramCall, getBotIdentity } from "@/lib/telegram.server";
 import { ensureSchema } from "@/db";
 
+// Surface every async failure in the Render logs — nothing should fail silently.
+process.on("unhandledRejection", (reason: any) => {
+  console.error("UNHANDLED REJECTION:", reason?.stack ?? reason);
+});
+process.on("uncaughtException", (err: any) => {
+  console.error("UNCAUGHT EXCEPTION:", err?.stack ?? err);
+});
+
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
@@ -24,12 +32,16 @@ app.post(WEBHOOK_PATH, async (req, res) => {
       },
       body: JSON.stringify(req.body ?? {}),
     });
+    // ACK Telegram immediately, then process in the background.
+    // Telegram re-delivers any webhook not answered within ~60s, which made
+    // long-running commands (/restore, broadcasts) execute multiple times.
+    res.status(200).json({ ok: true });
     const out = await handleWebhookRequest(request);
-    const text = await out.text();
-    res.status(out.status).type(out.headers.get("content-type") ?? "text/plain").send(text);
+    if (out.status >= 400) {
+      console.error("webhook handler error status", out.status, await out.text().catch(() => ""));
+    }
   } catch (e: any) {
-    console.error("webhook error", e);
-    res.status(200).json({ ok: false, error: e?.message ?? "error" });
+    console.error("webhook processing error:", e?.message ?? e, "\n", e?.stack ?? "");
   }
 });
 
@@ -104,7 +116,7 @@ async function main() {
   try {
     await ensureSchema();
   } catch (e: any) {
-    console.error("Turso schema init failed:", e?.message ?? e);
+    console.error("Turso schema init failed:", e?.message ?? e, e?.cause ? `(cause: ${e.cause})` : "");
   }
 
   app.listen(PORT, () => console.log(`listening on :${PORT}`));
