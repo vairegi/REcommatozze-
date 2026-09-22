@@ -795,13 +795,6 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
         const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
         const { handleBroadcastCommand, handleBroadcastMessage, handleBroadcastCallback } =
           await import("@/lib/broadcast-wizard.server");
-        const { sendPhotoBuffer, editMessageCaption, editPhotoBuffer } = await import("@/lib/telegram.server");
-        const {
-          deliverChannelBoard,
-          gatherChannelEntries,
-          buildBoardText,
-          filterEntries: chbFilterEntries,
-        } = await import("@/lib/channel-board.server");
 
         const expected = deriveWebhookSecret();
         const actual = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
@@ -825,23 +818,12 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
           seenUpdates.set(update.update_id, nowMs);
         }
 
-        // Callback queries (inline button taps) — route channel board, then broadcast wizard.
+        // Callback queries (inline button taps) — route channel-list refresh, then broadcast wizard.
         if (update.callback_query) {
           try {
             const cq = update.callback_query;
-            if (typeof cq?.data === "string" && cq.data.startsWith("chb:")) {
-              await handleChannelBoardCallback(cq, {
-                supabaseAdmin,
-                telegramCall,
-                getBotIdentity,
-                getChatMemberStatus,
-                escapeHtml,
-                sendPhotoBuffer,
-                editMessageCaption,
-                editPhotoBuffer,
-                deliverChannelBoard,
-              });
-              // (handleChannelBoardCallback is defined locally in this file)
+            if (typeof cq?.data === "string" && cq.data === "chl:refresh") {
+              await handleChannelListRefresh(cq);
             } else {
               await handleBroadcastCallback(cq);
             }
@@ -1247,19 +1229,10 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
               } else {
                 await handleChannelsCommand({
                   dmChatId: chat.id,
-                  argText: text,
                   supabaseAdmin,
                   telegramCall,
                   getBotIdentity,
                   getChatMemberStatus,
-                  escapeHtml,
-                  sendPhotoBuffer,
-                  editMessageCaption,
-                  editPhotoBuffer,
-                  deliverChannelBoard,
-                  gatherChannelEntries,
-                  buildBoardText,
-                  chbFilterEntries,
                 });
               }
             } else if (cmd === "/leave") {
@@ -1381,130 +1354,234 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
         return Response.json({ ok: true });
 }
 
-async function handleChannelsCommand(args: {
-  dmChatId: number;
-  argText: string;
+// ---------------------------------------------------------------------------
+// /channels — v3 SCRAPJAV-style compact text grid.
+// Single monospace <pre> table, one line per channel, faint ─ separators,
+// small caption, one 🔄 Refresh button on the LAST chunk. No image, no
+// per-channel buttons. Data pulled from Turso + live-verified every call.
+// ---------------------------------------------------------------------------
+
+// Per-admin memory of the previous board's message ids, so Refresh can
+// delete+resend and leave no stale duplicates. Memory-only — after a Render
+// restart the first Refresh just posts a fresh board.
+const channelBoardMessages = new Map<number, number[]>();
+
+const CHB_PARTNER_BOT = "@InsideAds_bot";
+const CHB_PRIORITY = ["MINE", "ADULT", "MANGA"];
+const CHB_MAXLEN = 3400; // safely under Telegram's 4096-char cap incl. <pre>
+
+interface ChbEntry {
+  type: "channel" | "supergroup" | "group";
+  title: string;
+  chatId: number;
+  cats: string[];
+  iads: boolean;
+  locked: boolean;
+  url?: string;
+}
+
+async function gatherChannelEntries(deps: {
   supabaseAdmin: any;
   telegramCall: (m: string, b?: Record<string, unknown>) => Promise<any>;
   getBotIdentity: () => Promise<{ id: number; username?: string }>;
   getChatMemberStatus: (chatId: number, userId: number) => Promise<string | null>;
-  escapeHtml: (s: string) => string;
-  sendPhotoBuffer: (a: any) => Promise<any>;
-  editMessageCaption: (a: any) => Promise<any>;
-  editPhotoBuffer: (a: any) => Promise<any>;
-  deliverChannelBoard: (d: any) => Promise<void>;
-  gatherChannelEntries: (d: any) => Promise<any[]>;
-  buildBoardText: (entries: any[], esc: (s: string) => string) => string;
-  chbFilterEntries: (entries: any[], filter?: string | null) => any[];
-}) {
-  const {
-    dmChatId, argText, supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus,
-    escapeHtml, sendPhotoBuffer, editMessageCaption, editPhotoBuffer,
-    deliverChannelBoard, gatherChannelEntries, buildBoardText, chbFilterEntries,
-  } = args;
+}): Promise<ChbEntry[]> {
+  const { supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus } = deps;
 
-  await telegramCall("sendMessage", { chat_id: dmChatId, text: "🔍 Checking chats…" });
+  const { data: chats } = await supabaseAdmin
+    .from("telegram_chats")
+    .select("chat_id, title, type, username, first_seen_at")
+    .in("type", ["group", "supergroup", "channel"])
+    .order("first_seen_at", { ascending: true })
+    .limit(200);
+  if (!chats?.length) return [];
 
-  const rest = (argText ?? "").trim().split(/\s+/).slice(1).join(" ").trim();
-  const sendLegacy = async (entries: any[]) => {
-    const fullList = buildBoardText(entries, escapeHtml);
-    const MAXLEN = 3800;
-    const chunks: string[] = [];
-    let cur = "";
-    for (const line of fullList.split("\n")) {
-      if (cur && (cur + "\n" + line).length > MAXLEN) { chunks.push(cur); cur = line; }
-      else { cur = cur ? cur + "\n" + line : line; }
+  const bot = await getBotIdentity();
+  let partnerId: number | null = null;
+  try {
+    const info = await telegramCall("getChat", { chat_id: CHB_PARTNER_BOT });
+    partnerId = Number(info?.id) || null;
+  } catch (e) {
+    console.warn("getChat partner bot failed", e);
+  }
+
+  const { data: listRows } = await supabaseAdmin.from("chat_lists").select("category, chat_id");
+  const listsByChat = new Map<number, string[]>();
+  for (const r of (listRows as any[]) ?? []) {
+    const id = Number(r.chat_id);
+    const arr = listsByChat.get(id) ?? [];
+    if (!arr.includes(r.category)) arr.push(r.category);
+    listsByChat.set(id, arr);
+  }
+
+  const raw = await Promise.all(
+    chats.map(async (c: any): Promise<ChbEntry | null> => {
+      const botStatus = await getChatMemberStatus(c.chat_id, bot.id);
+      if (!(botStatus === "administrator" || botStatus === "creator")) return null;
+
+      let iads = false;
+      if (partnerId) {
+        const ps = await getChatMemberStatus(c.chat_id, partnerId);
+        iads = ps === "administrator" || ps === "creator";
+      }
+
+      const title = String(c.title || c.username || `Chat ${c.chat_id}`);
+      let url: string | undefined;
+      let locked = false;
+      if (c.username) {
+        url = `https://t.me/${c.username}`;
+      } else {
+        try {
+          const info = await telegramCall("getChat", { chat_id: c.chat_id });
+          url = info?.invite_link;
+          if (!url) {
+            try {
+              const created = await telegramCall("exportChatInviteLink", { chat_id: c.chat_id });
+              if (typeof created === "string") url = created;
+            } catch { /* private, no link */ }
+          }
+          if (!url) locked = true;
+        } catch (e) {
+          console.warn("getChat failed", c.chat_id, e);
+        }
+      }
+      if (url) {
+        try {
+          await supabaseAdmin.from("telegram_chats").update({ invite_link: url }).eq("chat_id", c.chat_id);
+        } catch { /* ignore */ }
+      }
+
+      const cats = (listsByChat.get(Number(c.chat_id)) ?? []).map((x: any) => String(x).toUpperCase());
+      const type = c.type === "channel" ? "channel" : c.type === "supergroup" ? "supergroup" : "group";
+      return { type, title, chatId: Number(c.chat_id), cats, iads, locked, url };
+    }),
+  );
+
+  const rank = (cats: string[]) => {
+    if (!cats.length) return 10_000;
+    let best = 9_999;
+    for (const c of cats) {
+      const i = CHB_PRIORITY.indexOf(c);
+      best = Math.min(best, i >= 0 ? i : 100);
     }
-    if (cur) chunks.push(cur);
-    for (let ci = 0; ci < chunks.length; ci++) {
-      const head = chunks.length > 1 ? `📋 <b>Chats (part ${ci + 1}/${chunks.length})</b>\n\n` : "";
-      await telegramCall("sendMessage", { chat_id: dmChatId, text: head + chunks[ci], parse_mode: "HTML", disable_web_page_preview: true });
-    }
+    return best;
   };
+  return (raw.filter(Boolean) as ChbEntry[])
+    .map((e, i) => ({ ...e, i }))
+    .sort((a, b) => rank(a.cats) - rank(b.cats) || (a as any).i - (b as any).i);
+}
 
-  // /channels text → legacy chunked text list (clickable links in text)
-  if (/^text$/i.test(rest)) {
-    const entries = await gatherChannelEntries({ supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus });
-    if (!entries.length) { await telegramCall("sendMessage", { chat_id: dmChatId, text: "I'm not in any groups or channels yet." }); return; }
-    await sendLegacy(entries);
-    return;
-  }
+// Compact single-line row: "NN. Name        TAG   ✅🔒"  (≤ ~52 mono chars).
+function chbRow(num: number, e: ChbEntry): string {
+  const n = String(num).padStart(2, " ");
+  const display = e.title.length > 24 ? e.title.slice(0, 23) + "…" : e.title;
+  const name = escapeHtml(display.padEnd(24, " "));
+  const linked = e.url ? `<a href="${escapeHtml(e.url)}">${name}</a>` : name;
+  const tags = escapeHtml((e.cats.length ? e.cats.join("|") : "NONE").padEnd(10, " "));
+  const flags = `${e.iads ? " ✅" : "  "}${e.locked ? " 🔒" : ""}`;
+  return `${n}. ${linked}  ${tags}${flags}`;
+}
 
-  // /channels <filter> [text] → pre-filtered board (or text)
-  let filter: string | null = null;
-  let forceText = false;
-  if (rest) {
-    const parts = rest.split(/\s+/);
-    if (parts[parts.length - 1].toLowerCase() === "text") { forceText = true; parts.pop(); }
-    filter = parts.join(" ").trim() || null;
-  }
-  if (forceText) {
-    const entries = await gatherChannelEntries({ supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus });
-    if (!entries.length) { await telegramCall("sendMessage", { chat_id: dmChatId, text: "I'm not in any groups or channels yet." }); return; }
-    await sendLegacy(chbFilterEntries(entries, filter));
-    return;
-  }
+function buildChannelBoardChunks(entries: ChbEntry[]): string[] {
+  const buckets: Record<ChbEntry["type"], ChbEntry[]> = { channel: [], supergroup: [], group: [] };
+  for (const e of entries) buckets[e.type].push(e);
 
-  await deliverChannelBoard({
-    dmChatId, supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus,
-    escapeHtml, sendPhotoBuffer, editMessageCaption, editPhotoBuffer, sendLegacy, filter,
+  const SEP = "─".repeat(52);
+  const HEAD = ` N  Name                      List        Flags`;
+  const lines: string[] = [];
+  let num = 0;
+  const section = (label: string, rows: ChbEntry[]) => {
+    if (!rows.length) return;
+    lines.push("", label, SEP, HEAD, SEP);
+    for (const e of rows) lines.push(chbRow(++num, e));
+  };
+  section(`📢 CHANNELS (${buckets.channel.length})`, buckets.channel);
+  section(`👥 SUPERGROUPS (${buckets.supergroup.length})`, buckets.supergroup);
+  section(`👥 GROUPS (${buckets.group.length})`, buckets.group);
+
+  const stamp = (() => {
+    try {
+      return new Date().toLocaleString("en-GB", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+    } catch { return new Date().toISOString().slice(0, 16).replace("T", " "); }
+  })();
+  const header = `🎯 <b>CHANNELS — live board</b> · ${entries.length} chats · ${escapeHtml(stamp)} IST`;
+  const footer = `<i>Tap a name to open · List = MINE|ADULT|MANGA|... · ✅ = @InsideAds_bot admin · 🔒 = no invite link</i>`;
+
+  const chunks: string[] = [];
+  let cur = "";
+  for (const ln of lines) {
+    const candidate = cur ? cur + "\n" + ln : ln;
+    if (cur && (header + "\n<pre>" + candidate + "</pre>\n" + footer).length > CHB_MAXLEN) {
+      chunks.push(cur); cur = ln;
+    } else cur = candidate;
+  }
+  if (cur) chunks.push(cur);
+  return chunks.map((body, i) => {
+    const page = chunks.length > 1 ? ` <i>(${i + 1}/${chunks.length})</i>` : "";
+    const head = i === 0 ? header + "\n" : "";
+    const foot = i === chunks.length - 1 ? "\n" + footer : "";
+    return head + `<pre>${body.replace(/^\n+/, "")}</pre>` + page + foot;
   });
 }
 
-async function handleChannelBoardCallback(cq: any, deps: {
+async function sendChannelBoard(dmChatId: number, entries: ChbEntry[], telegramCall: any): Promise<void> {
+  // Wipe the previous board so Refresh never leaves stale duplicates.
+  const old = channelBoardMessages.get(dmChatId) ?? [];
+  for (const mid of old) {
+    try { await telegramCall("deleteMessage", { chat_id: dmChatId, message_id: mid }); } catch { /* already gone */ }
+  }
+
+  const chunks = buildChannelBoardChunks(entries);
+  const sentIds: number[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const res = await telegramCall("sendMessage", {
+      chat_id: dmChatId,
+      text: chunks[i],
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      ...(isLast ? { reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "chl:refresh" }]] } } : {}),
+    });
+    if (res?.message_id) sentIds.push(res.message_id);
+  }
+  channelBoardMessages.set(dmChatId, sentIds);
+}
+
+async function handleChannelsCommand(args: {
+  dmChatId: number;
   supabaseAdmin: any;
   telegramCall: (m: string, b?: Record<string, unknown>) => Promise<any>;
   getBotIdentity: () => Promise<{ id: number; username?: string }>;
   getChatMemberStatus: (chatId: number, userId: number) => Promise<string | null>;
-  escapeHtml: (s: string) => string;
-  sendPhotoBuffer: (a: any) => Promise<any>;
-  editMessageCaption: (a: any) => Promise<any>;
-  editPhotoBuffer: (a: any) => Promise<any>;
-  deliverChannelBoard: (d: any) => Promise<void>;
 }) {
-  const { telegramCall } = deps;
-  const data: string = String(cq?.data ?? "");
-  const fromId: number = Number(cq?.from?.id);
-  const msg = cq?.message;
-  const chatId: number = Number(msg?.chat?.id);
-  const messageId: number = Number(msg?.message_id);
-  const chatType: string = String(msg?.chat?.type ?? "private");
+  const { dmChatId, telegramCall } = args;
+  await telegramCall("sendMessage", { chat_id: dmChatId, text: "🔍 Checking chats…" });
+  const entries = await gatherChannelEntries(args);
+  if (!entries.length) {
+    await telegramCall("sendMessage", { chat_id: dmChatId, text: "I'm not in any groups or channels yet." });
+    return;
+  }
+  await sendChannelBoard(dmChatId, entries, telegramCall);
+}
 
-  // Mirror the /channels rules: admin-only, DM-only.
-  const { is } = await isBotAdmin(deps.supabaseAdmin, fromId);
+async function handleChannelListRefresh(cq: any) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { telegramCall, getBotIdentity, getChatMemberStatus } = await import("@/lib/telegram.server");
+  const fromId = Number(cq?.from?.id);
+  const chatId = Number(cq?.message?.chat?.id);
+  const chatType = String(cq?.message?.chat?.type ?? "private");
+
+  const { is } = await isBotAdmin(supabaseAdmin, fromId);
   if (!is) { await telegramCall("answerCallbackQuery", { callback_query_id: cq.id, text: "⛔ Admins only.", show_alert: true }); return; }
-  if (chatType !== "private") { await telegramCall("answerCallbackQuery", { callback_query_id: cq.id, text: "🔒 Use the board in DM.", show_alert: true }); return; }
+  if (chatType !== "private") { await telegramCall("answerCallbackQuery", { callback_query_id: cq.id, text: "🔒 Use /channels in DM.", show_alert: true }); return; }
 
-  let filter: string | null = null;
-  if (data.startsWith("chb:cat:")) filter = data.slice(8).trim() || null;
-  else if (data.startsWith("chb:refresh:")) filter = data.slice(12).trim() || null;
-  else if (data === "chb:all") filter = null;
-
-  const sendLegacy = async (entries: any[]) => {
-    const { buildBoardText } = await import("@/lib/channel-board.server");
-    const fullList = buildBoardText(entries, deps.escapeHtml);
-    const MAXLEN = 3800;
-    const chunks: string[] = [];
-    let cur = "";
-    for (const line of fullList.split("\n")) {
-      if (cur && (cur + "\n" + line).length > MAXLEN) { chunks.push(cur); cur = line; }
-      else { cur = cur ? cur + "\n" + line : line; }
-    }
-    if (cur) chunks.push(cur);
-    for (let ci = 0; ci < chunks.length; ci++) {
-      const head = chunks.length > 1 ? `📋 <b>Chats (part ${ci + 1}/${chunks.length})</b>\n\n` : "";
-      await telegramCall("sendMessage", { chat_id: chatId, text: head + chunks[ci], parse_mode: "HTML", disable_web_page_preview: true });
-    }
-  };
-
-  await deps.deliverChannelBoard({
-    dmChatId: chatId, supabaseAdmin: deps.supabaseAdmin, telegramCall,
-    getBotIdentity: deps.getBotIdentity, getChatMemberStatus: deps.getChatMemberStatus,
-    escapeHtml: deps.escapeHtml, sendPhotoBuffer: deps.sendPhotoBuffer,
-    editMessageCaption: deps.editMessageCaption, editPhotoBuffer: deps.editPhotoBuffer,
-    sendLegacy, filter, messageId,
-  });
-  await telegramCall("answerCallbackQuery", { callback_query_id: cq.id, text: "🔄 Board updated" });
+  await telegramCall("answerCallbackQuery", { callback_query_id: cq.id, text: "🔄 Refreshing…" });
+  const entries = await gatherChannelEntries({ supabaseAdmin, telegramCall, getBotIdentity, getChatMemberStatus });
+  if (!entries.length) {
+    await telegramCall("sendMessage", { chat_id: chatId, text: "I'm not in any groups or channels yet." });
+    return;
+  }
+  await sendChannelBoard(chatId, entries, telegramCall);
 }
 
 // ---- legacy implementation kept for reference (unused) ----
