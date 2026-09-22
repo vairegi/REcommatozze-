@@ -100,3 +100,80 @@ export const REACTION_EMOJIS = [
   "🎉","🤩","😢","🙏","👌","🕊","🤣","⚡","🍌","🏆",
   "💯","🤗","🫡","😍","🐳","❤‍🔥","🌚","🌭","💅","🤪",
 ];
+
+/** Send a PNG (or any image) held in memory via multipart/form-data. */
+export async function sendPhotoBuffer(args: {
+  chatId: number;
+  png: Buffer | Uint8Array;
+  caption?: string;
+  parseMode?: string;
+  replyMarkup?: Record<string, unknown>;
+}): Promise<any> {
+  const form = new FormData();
+  form.append("chat_id", String(args.chatId));
+  const bytes = args.png instanceof Uint8Array ? args.png : new Uint8Array(args.png as ArrayLike<number>);
+  // Copy into a fresh ArrayBuffer so the Blob gets a clean ArrayBuffer (not SharedArrayBuffer).
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  form.append("photo", new Blob([ab], { type: "image/png" }), "board.png");
+  if (args.caption) {
+    form.append("caption", args.caption);
+    form.append("parse_mode", args.parseMode ?? "HTML");
+  }
+  if (args.replyMarkup) form.append("reply_markup", JSON.stringify(args.replyMarkup));
+  const res = await fetch(`${apiBase()}/sendPhoto`, { method: "POST", body: form });
+  const json: any = await res.json();
+  if (!res.ok || json.ok === false) {
+    throw new Error(`Telegram sendPhoto failed: ${json?.description ?? res.status}`);
+  }
+  return json.result;
+}
+
+/** Replace the image + caption + keyboard of an existing photo message (true board refresh). */
+export async function editPhotoBuffer(args: {
+  chatId: number;
+  messageId: number;
+  png: Buffer | Uint8Array;
+  caption?: string;
+  parseMode?: string;
+  replyMarkup?: Record<string, unknown>;
+}): Promise<any> {
+  const form = new FormData();
+  form.append("chat_id", String(args.chatId));
+  form.append("message_id", String(args.messageId));
+  const bytes = args.png instanceof Uint8Array ? args.png : new Uint8Array(args.png as ArrayLike<number>);
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  form.append(
+    "media",
+    JSON.stringify({
+      type: "photo",
+      media: "attach://board.png",
+      caption: args.caption ?? "",
+      parse_mode: args.parseMode ?? "HTML",
+    }),
+  );
+  form.append("board.png", new Blob([ab], { type: "image/png" }), "board.png");
+  if (args.replyMarkup) form.append("reply_markup", JSON.stringify(args.replyMarkup));
+  const res = await fetch(`${apiBase()}/editMessageMedia`, { method: "POST", body: form });
+  const json: any = await res.json();
+  if (!res.ok || json.ok === false) {
+    throw new Error(`Telegram editMessageMedia failed: ${json?.description ?? res.status}`);
+  }
+  return json.result;
+}
+
+/** Edit the caption + inline keyboard of an existing photo message (used for board Refresh/filter). */
+export async function editMessageCaption(args: {
+  chatId: number;
+  messageId: number;
+  caption?: string;
+  parseMode?: string;
+  replyMarkup?: Record<string, unknown>;
+}): Promise<any> {
+  return telegramCall("editMessageCaption", {
+    chat_id: args.chatId,
+    message_id: args.messageId,
+    caption: args.caption ?? "",
+    parse_mode: args.parseMode ?? "HTML",
+    reply_markup: args.replyMarkup,
+  });
+}
