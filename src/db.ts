@@ -49,6 +49,10 @@ function arg(v: string | null): Arg {
 }
 
 function endpoint(): string {
+  // TURSO_ENDPOINT is a dev/test override (used by the sandbox harness);
+  // production leaves it unset and uses TURSO_DATABASE_URL.
+  const override = process.env.TURSO_ENDPOINT;
+  if (override) return override;
   // Accept libsql://, turso://, https:// (and a bare host): the Turso dashboard
   // and CLI print different schemes, and Node fetch only speaks http(s).
   const raw = (process.env.TURSO_DATABASE_URL ?? "").trim();

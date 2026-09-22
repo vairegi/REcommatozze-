@@ -1355,10 +1355,14 @@ export async function handleWebhookRequest(request: Request): Promise<Response> 
 }
 
 // ---------------------------------------------------------------------------
-// /channels — v3 SCRAPJAV-style compact text grid.
-// Single monospace <pre> table, one line per channel, faint ─ separators,
-// small caption, one 🔄 Refresh button on the LAST chunk. No image, no
-// per-channel buttons. Data pulled from Turso + live-verified every call.
+// /channels — v4 native Rich Message TABLE (Bot API ≥10.2 sendRichMessage).
+// A real <table>-equivalent block (InputRichBlockTable): header row, one row
+// per channel, clickable channel-name links inside cells (RichTextUrl),
+// is_bordered + is_striped + is_compact. One 🔄 Refresh inline button on the
+// LAST chunk (sendRichMessage supports reply_markup). If the Bot API rejects
+// the rich message (older server), we automatically fall back to the v3
+// monospace <pre> grid so the command never breaks.
+// Data pulled from Turso + live-verified on every call.
 // ---------------------------------------------------------------------------
 
 // Per-admin memory of the previous board's message ids, so Refresh can
@@ -1369,6 +1373,7 @@ const channelBoardMessages = new Map<number, number[]>();
 const CHB_PARTNER_BOT = "@InsideAds_bot";
 const CHB_PRIORITY = ["MINE", "ADULT", "MANGA"];
 const CHB_MAXLEN = 3400; // safely under Telegram's 4096-char cap incl. <pre>
+const CHB_MAX_TABLE_ROWS = 120; // rich-message limit: ≤500 blocks; 120 rows/chunk is safe
 
 interface ChbEntry {
   type: "channel" | "supergroup" | "group";
@@ -1471,6 +1476,127 @@ async function gatherChannelEntries(deps: {
     .sort((a, b) => rank(a.cats) - rank(b.cats) || (a as any).i - (b as any).i);
 }
 
+// ---- Rich Message table builders (v4) ----
+
+/** RichText helpers — plain strings, or {type:"url"} for clickable cells. */
+function rtLinked(text: string, url?: string): any {
+  return url ? { type: "url", text, url } : text;
+}
+function rtBold(text: string): any {
+  return { type: "bold", text };
+}
+
+/** One table row for a channel: N | Name(link) | List | IAds. */
+function chbTableRow(num: number, e: ChbEntry): any[] {
+  const display = e.title.length > 28 ? e.title.slice(0, 27) + "…" : e.title;
+  const nameCell = e.locked ? `${display} 🔒` : display;
+  return [
+    { text: String(num), align: "right" },
+    { text: rtLinked(nameCell, e.url) },
+    { text: e.cats.length ? e.cats.join("|") : "—" },
+    { text: e.iads ? "✅" : "—", align: "center" },
+  ];
+}
+
+/**
+ * Build one InputRichMessage: section heading(s) + one bordered table + footer.
+ * Table is chunked at CHB_MAX_TABLE_ROWS rows per message to stay under the
+ * 500-block rich-message limit. Returns an array of rich-message payloads.
+ */
+function buildChannelBoardRich(entries: ChbEntry[]): any[] {
+  const buckets: Record<ChbEntry["type"], ChbEntry[]> = { channel: [], supergroup: [], group: [] };
+  for (const e of entries) buckets[e.type].push(e);
+
+  const stamp = (() => {
+    try {
+      return new Date().toLocaleString("en-GB", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+    } catch { return new Date().toISOString().slice(0, 16).replace("T", " "); }
+  })();
+
+  // Flatten into sectioned rows: heading blocks + table row entries.
+  interface Section { label: string; rows: ChbEntry[] }
+  const sections: Section[] = [];
+  if (buckets.channel.length) sections.push({ label: `📢 Channels (${buckets.channel.length})`, rows: buckets.channel });
+  if (buckets.supergroup.length) sections.push({ label: `👥 Supergroups (${buckets.supergroup.length})`, rows: buckets.supergroup });
+  if (buckets.group.length) sections.push({ label: `👥 Groups (${buckets.group.length})`, rows: buckets.group });
+
+  const messages: any[] = [];
+  let num = 0;
+  let blocks: any[] = [];
+  let tableCells: any[][] = [];
+  let tableRows = 0;
+
+  const flushTable = () => {
+    if (!tableCells.length) return;
+    blocks.push({
+      type: "table",
+      cells: tableCells,
+      is_bordered: true,
+      is_striped: true,
+      is_compact: true,
+    });
+    tableCells = [];
+    tableRows = 0;
+  };
+  const flushMessage = (isLast: boolean) => {
+    flushTable();
+    if (!blocks.length) return;
+    if (isLast) {
+      blocks.push({ type: "divider" });
+      blocks.push({
+        type: "footer",
+        text: `Tap a channel name to open it · List = MINE|ADULT|MANGA · ✅ = @InsideAds_bot also admin · 🔒 = no invite link`,
+      });
+    }
+    messages.push({ blocks });
+    blocks = [];
+  };
+
+  for (let si = 0; si < sections.length; si++) {
+    const sec = sections[si];
+    // If the section won't fit in the remaining row budget, close the message.
+    if (tableRows + sec.rows.length + 1 > CHB_MAX_TABLE_ROWS && blocks.length) {
+      flushMessage(false);
+    }
+    blocks.push({ type: "heading", text: rtBold(sec.label), size: 4 });
+    tableCells.push([
+      { text: rtBold("#"), is_header: true, align: "right" },
+      { text: rtBold("Channel"), is_header: true },
+      { text: rtBold("List"), is_header: true },
+      { text: rtBold("IAds"), is_header: true, align: "center" },
+    ]);
+    tableRows++;
+    for (const e of sec.rows) {
+      if (tableRows + 1 > CHB_MAX_TABLE_ROWS) {
+        flushMessage(false);
+        tableCells.push([
+          { text: rtBold("#"), is_header: true, align: "right" },
+          { text: rtBold("Channel (cont.)"), is_header: true },
+          { text: rtBold("List"), is_header: true },
+          { text: rtBold("IAds"), is_header: true, align: "center" },
+        ]);
+        tableRows++;
+      }
+      tableCells.push(chbTableRow(++num, e));
+      tableRows++;
+    }
+    // close each section's table so every section is its own bordered table
+    flushTable();
+  }
+  flushMessage(true);
+
+  // Attach the board header (timestamp + count) to the FIRST message.
+  if (messages.length) {
+    messages[0].blocks.unshift({
+      type: "paragraph",
+      text: [rtBold("🎯 CHANNELS — live board"), `  ·  ${entries.length} chats  ·  ${stamp} IST`],
+    });
+  }
+  return messages;
+}
+
+// ---- v3 monospace grid (kept as automatic fallback) ----
+
 // Compact single-line row: "NN. Name        TAG   ✅🔒"  (≤ ~52 mono chars).
 function chbRow(num: number, e: ChbEntry): string {
   const n = String(num).padStart(2, " ");
@@ -1524,15 +1650,8 @@ function buildChannelBoardChunks(entries: ChbEntry[]): string[] {
   });
 }
 
-async function sendChannelBoard(dmChatId: number, entries: ChbEntry[], telegramCall: any): Promise<void> {
-  // Wipe the previous board so Refresh never leaves stale duplicates.
-  const old = channelBoardMessages.get(dmChatId) ?? [];
-  for (const mid of old) {
-    try { await telegramCall("deleteMessage", { chat_id: dmChatId, message_id: mid }); } catch { /* already gone */ }
-  }
-
+async function sendChannelBoardText(dmChatId: number, entries: ChbEntry[], telegramCall: any): Promise<void> {
   const chunks = buildChannelBoardChunks(entries);
-  const sentIds: number[] = [];
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
     const res = await telegramCall("sendMessage", {
@@ -1542,9 +1661,40 @@ async function sendChannelBoard(dmChatId: number, entries: ChbEntry[], telegramC
       disable_web_page_preview: true,
       ...(isLast ? { reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "chl:refresh" }]] } } : {}),
     });
-    if (res?.message_id) sentIds.push(res.message_id);
+    if (res?.message_id) (channelBoardMessages.get(dmChatId) ?? channelBoardMessages.set(dmChatId, []).get(dmChatId)!).push(res.message_id);
   }
-  channelBoardMessages.set(dmChatId, sentIds);
+}
+
+async function sendChannelBoard(dmChatId: number, entries: ChbEntry[], telegramCall: any): Promise<void> {
+  // Wipe the previous board so Refresh never leaves stale duplicates.
+  const old = channelBoardMessages.get(dmChatId) ?? [];
+  for (const mid of old) {
+    try { await telegramCall("deleteMessage", { chat_id: dmChatId, message_id: mid }); } catch { /* already gone */ }
+  }
+  channelBoardMessages.set(dmChatId, []);
+
+  // Try the native Rich Message table first (Bot API ≥ 10.2).
+  try {
+    const richMessages = buildChannelBoardRich(entries);
+    const sentIds: number[] = [];
+    for (let i = 0; i < richMessages.length; i++) {
+      const isLast = i === richMessages.length - 1;
+      const res = await telegramCall("sendRichMessage", {
+        chat_id: dmChatId,
+        rich_message: richMessages[i],
+        disable_notification: true,
+        ...(isLast ? { reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "chl:refresh" }]] } } : {}),
+      });
+      if (res?.message_id) sentIds.push(res.message_id);
+    }
+    channelBoardMessages.set(dmChatId, sentIds);
+    return;
+  } catch (e) {
+    console.warn("sendRichMessage (table) failed — falling back to <pre> text grid:", e);
+  }
+
+  // Fallback: v3 monospace grid, same single Refresh button on the last chunk.
+  await sendChannelBoardText(dmChatId, entries, telegramCall);
 }
 
 async function handleChannelsCommand(args: {
