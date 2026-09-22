@@ -8,6 +8,10 @@ export function botToken(): string {
 }
 
 export function apiBase(): string {
+  // TELEGRAM_API_BASE is a dev/test override (used by the sandbox harness);
+  // production leaves it unset and hits the real Bot API.
+  const override = process.env.TELEGRAM_API_BASE;
+  if (override) return `${override.replace(/\/$/, "")}${botToken()}`;
   return `https://api.telegram.org/bot${botToken()}`;
 }
 
